@@ -2,6 +2,8 @@
 
 #include <memory>
 #include <sstream>
+#include <vector>
+#include <map>
 
 #include <ts/ts.h>
 
@@ -11,10 +13,16 @@
 
 class JavascriptPlugin
 {
-	std::string m_script;
-	v8::Persistent<v8::Context> m_ctxt;
+  typedef v8::Persistent<v8::Object> hook_t;
+  typedef std::vector<hook_t *> hook_list_t;
+  typedef std::map<TSHttpHookID, hook_list_t> http_hook_map_t;
 
-	void init();
+  static http_hook_map_t s_httpHooks;
+
+  std::string m_script;
+  v8::Persistent<v8::Context> m_ctxt;
+
+  void init();
 
   static v8::Handle<v8::Value> getVersion(v8::Local<v8::String> property, const v8::AccessorInfo& info);
   static v8::Handle<v8::Value> getInstallDir(v8::Local<v8::String> property, const v8::AccessorInfo& info);
@@ -25,17 +33,21 @@ class JavascriptPlugin
   static v8::Handle<v8::Value> reportError(const v8::Arguments& args);  
 
   static v8::Handle<v8::Value> registerHttpHook(const v8::Arguments& args);
+
+  static int httpHookDispatcher(TSCont contp, TSEvent event, void *edata);
 public:
-	JavascriptPlugin() {
-		init();
-	}
+  JavascriptPlugin() {
+    init();
+  }
 
-	bool load(const char *filename);
+  bool load(const char *filename);
 
-	bool execute(void);
+  bool execute(void);
 
-	bool hook(void);
+  bool hook(void);
 };
+
+JavascriptPlugin::http_hook_map_t JavascriptPlugin::s_httpHooks;
 
 v8::Handle<v8::Value> JavascriptPlugin::getVersion(v8::Local<v8::String> property, const v8::AccessorInfo& info)
 {
@@ -101,7 +113,38 @@ v8::Handle<v8::Value> JavascriptPlugin::reportError(const v8::Arguments& args)
 
 v8::Handle<v8::Value> JavascriptPlugin::registerHttpHook(const v8::Arguments& args)
 {
+  v8::HandleScope handle_scope;
+
+  v8::TryCatch try_catch;
+
+  if (args.Length() < 2 || !args[0]->IsInt32() || !args[1]->IsFunction()) 
+  {
+    v8::ThrowException(v8::Exception::Error(v8::String::New("invalid arguments")));
+
+    return v8::Undefined();
+  }
+
+  TSHttpHookID hookId = (TSHttpHookID) args[0]->Int32Value();
+
+  TSDEBUG(TAG_NAME, "register http #%d hook...\n", hookId);
+
+  if (s_httpHooks.find(hookId) == s_httpHooks.end()) 
+  {
+    hook_list_t hooks;
+
+    s_httpHooks[hookId] = hooks;
+
+    TSHttpHookAdd(hookId, TSContCreate(httpHookDispatcher, NULL));
+  } 
+ 
+  s_httpHooks[hookId].push_back(new hook_t(args[1]->ToObject()));
+
   return v8::Undefined();
+}
+
+int JavascriptPlugin::httpHookDispatcher(TSCont contp, TSEvent event, void *edata)
+{
+  return 0;
 }
 
 void JavascriptPlugin::init()
@@ -109,6 +152,28 @@ void JavascriptPlugin::init()
   v8::HandleScope handle_scope;         
 
   v8::Handle<v8::ObjectTemplate> ats = v8::ObjectTemplate::New();
+
+  #define DEF_AST_CONST(name) ats->Set(v8::String::NewSymbol(#name), v8::Integer::New(name));
+
+  DEF_AST_CONST(TS_HTTP_READ_REQUEST_HDR_HOOK);
+  DEF_AST_CONST(TS_HTTP_OS_DNS_HOOK);
+  DEF_AST_CONST(TS_HTTP_SEND_REQUEST_HDR_HOOK);
+  DEF_AST_CONST(TS_HTTP_READ_CACHE_HDR_HOOK);
+  DEF_AST_CONST(TS_HTTP_READ_RESPONSE_HDR_HOOK);
+  DEF_AST_CONST(TS_HTTP_SEND_RESPONSE_HDR_HOOK);
+  DEF_AST_CONST(TS_HTTP_REQUEST_TRANSFORM_HOOK);
+  DEF_AST_CONST(TS_HTTP_RESPONSE_TRANSFORM_HOOK);
+  DEF_AST_CONST(TS_HTTP_SELECT_ALT_HOOK);
+  DEF_AST_CONST(TS_HTTP_TXN_START_HOOK);
+  DEF_AST_CONST(TS_HTTP_TXN_CLOSE_HOOK);
+  DEF_AST_CONST(TS_HTTP_SSN_START_HOOK);
+  DEF_AST_CONST(TS_HTTP_SSN_CLOSE_HOOK);
+  DEF_AST_CONST(TS_HTTP_CACHE_LOOKUP_COMPLETE_HOOK);
+  DEF_AST_CONST(TS_HTTP_PRE_REMAP_HOOK);
+  DEF_AST_CONST(TS_HTTP_POST_REMAP_HOOK);
+  DEF_AST_CONST(TS_HTTP_LAST_HOOK);
+
+  #undef DEF_AST_CONST
 
   ats->SetAccessor(v8::String::NewSymbol("version"), getVersion);
   ats->SetAccessor(v8::String::NewSymbol("installDir"), getInstallDir);
@@ -161,44 +226,39 @@ bool JavascriptPlugin::execute()
 {
   v8::HandleScope handle_scope; 
 
-	v8::Context::Scope context_scope(m_ctxt);
+  v8::Context::Scope context_scope(m_ctxt);
 
-	v8::TryCatch try_catch;
+  v8::TryCatch try_catch;
 
-	v8::Handle<v8::String> script = v8::String::New(m_script.c_str(), m_script.size());
+  v8::Handle<v8::String> script = v8::String::New(m_script.c_str(), m_script.size());
 
   TSDEBUG(TAG_NAME, "compiling script...");
 
-	v8::Handle<v8::Script> compiled_script = v8::Script::Compile(script);
+  v8::Handle<v8::Script> compiled_script = v8::Script::Compile(script);
 
-	if (compiled_script.IsEmpty()) {
+  if (compiled_script.IsEmpty()) {
     v8::String::Utf8Value error(try_catch.Exception());
 
-	  TSError("[%s] fail to compile script, %s", TAG_NAME, *error);
+    TSError("[%s] fail to compile script, %s", TAG_NAME, *error);
 
-	  return false;
-	}
+    return false;
+  }
 
   TSDEBUG(TAG_NAME, "executing script...");
 
-	v8::Handle<v8::Value> result = compiled_script->Run();
+  v8::Handle<v8::Value> result = compiled_script->Run();
 
-	if (result.IsEmpty()) {
-		v8::String::Utf8Value error(try_catch.Exception());
+  if (result.IsEmpty()) {
+    v8::String::Utf8Value error(try_catch.Exception());
 
-	  TSError("[%s] fail to execute script, %s", TAG_NAME, *error);
+    TSError("[%s] fail to execute script, %s", TAG_NAME, *error);
 
-	  return false;
-	}
+    return false;
+  }
 
   TSDEBUG(TAG_NAME, "execute script finished");
 
-	return true;
-}
-
-bool JavascriptPlugin::hook() 
-{
-	return true;
+  return true;
 }
 
 int
@@ -232,7 +292,7 @@ TSPluginInit(int argc, const char *argv[])
 {
   TSPluginRegistrationInfo info;
 
-  info.plugin_name = (char *) "jsts";
+  info.plugin_name = (char *) "tsjs";
   info.vendor_name = (char *) "Flier Lu";
   info.support_email = (char *) "flier.lu@gmail.com";
   
@@ -242,22 +302,20 @@ TSPluginInit(int argc, const char *argv[])
     TSError("[%s] Plugin requires Traffic Server 3.0 or later\n", TAG_NAME);
   } else if (argc != 2) {
     TSError("usage: %s <filename>\n", argv[0]);
-  } else { 	
+  } else {  
     std::auto_ptr<JavascriptPlugin> plugin(new JavascriptPlugin());
 
-  	if (!plugin->load(argv[1])) {
-  	  TSError("[%s] Could not load %s\n", TAG_NAME, argv[1]);
-  	} else if (!plugin->execute()) {
-  	  TSError("[%s] Could not initialize script\n", TAG_NAME);
-  	} else if (!plugin->hook()) {
-  	  TSError("[%s] Could not hook\n", TAG_NAME);
-  	} else {
-  	  TSDEBUG(TAG_NAME, "load plugin with script %s", argv[1]);
+    if (!plugin->load(argv[1])) {
+      TSError("[%s] Could not load %s\n", TAG_NAME, argv[1]);
+    } else if (!plugin->execute()) {
+      TSError("[%s] Could not initialize script\n", TAG_NAME);
+    } else {
+      TSDEBUG(TAG_NAME, "load plugin with script %s", argv[1]);
 
       plugin.release();
 
-  	  return;
-  	}
+      return;
+    }
   }
 
   TSError("[%s] Unable to initialize plugin\n", TAG_NAME);
